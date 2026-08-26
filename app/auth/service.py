@@ -3,7 +3,7 @@ import json
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from app.auth.models import ApiKeyOptions, ApiKeyPrincipal, ApiKeyPublic
 from app.core.database import Database
@@ -246,52 +246,28 @@ class ApiKeyService:
 
     def revoke(self, key_id: str) -> ApiKeyPublic:
         cursor = self.db.execute(
-            "UPDATE api_keys SET enabled = 0, revoked_at = ? WHERE id = ?",
+            "UPDATE api_keys SET enabled = 0, revoked_at = COALESCE(revoked_at, ?) WHERE id = ?",
             (to_iso(utc_now()), key_id),
         )
         if cursor.rowcount != 1:
             raise ApiError("api_key_not_found", "API key was not found", 404)
         return self.get_public(key_id)  # type: ignore[return-value]
 
-    def delete_permanently(self, key_id: str) -> None:
+    def delete_permanently(self, key_id: str) -> dict[str, Any]:
         with self.db.transaction() as connection:
             row = connection.execute(
-                "SELECT enabled, expires_at, revoked_at FROM api_keys WHERE id = ?",
+                "SELECT id FROM api_keys WHERE id = ?",
                 (key_id,),
             ).fetchone()
             if row is None:
-                raise ApiError("api_key_not_found", "API key was not found", 404)
+                return {"status": "already_deleted", "api_keys": 0, "id": key_id}
 
-            expires_at = from_iso(row["expires_at"])
-            active = bool(row["enabled"]) and row["revoked_at"] is None and (
-                expires_at is None or expires_at > utc_now()
-            )
-            if active:
-                raise ApiError(
-                    "api_key_active",
-                    "An active API key must be disabled, expired, or revoked before permanent deletion",
-                    409,
-                )
-
-            referenced = connection.execute(
-                """
-                SELECT
-                    EXISTS(SELECT 1 FROM usage_events WHERE api_key_id = ?) OR
-                    EXISTS(SELECT 1 FROM jobs WHERE api_key_id = ?) OR
-                    EXISTS(SELECT 1 FROM credit_ledger WHERE api_key_id = ?) OR
-                    EXISTS(SELECT 1 FROM credit_reservations WHERE api_key_id = ?)
-                    AS present
-                """,
-                (key_id, key_id, key_id, key_id),
-            ).fetchone()["present"]
-            if referenced:
-                raise ApiError(
-                    "api_key_has_history",
-                    "This API key has historical records and cannot be permanently deleted",
-                    409,
-                )
-
+            connection.execute("DELETE FROM credit_reservations WHERE api_key_id = ?", (key_id,))
+            connection.execute("DELETE FROM credit_ledger WHERE api_key_id = ?", (key_id,))
+            connection.execute("DELETE FROM usage_events WHERE api_key_id = ?", (key_id,))
+            connection.execute("DELETE FROM jobs WHERE api_key_id = ?", (key_id,))
             connection.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
+            return {"status": "deleted", "api_keys": 1, "id": key_id}
 
     @staticmethod
     def _public_from_row(row) -> ApiKeyPublic:

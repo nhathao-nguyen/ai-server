@@ -1,11 +1,15 @@
 import asyncio
 from contextlib import asynccontextmanager
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import JSONResponse
+
+logger = logging.getLogger("tts_server")
 
 from app.api.dependencies import AppServices, is_lan_client, require_loopback
 from app.api.routes_audio import router as audio_router
@@ -249,6 +253,33 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
             status_code=exc.status_code,
             content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}},
             headers=headers,
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(_request: Request, exc: RequestValidationError):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "validation_error",
+                    "message": "Dữ liệu yêu cầu không hợp lệ",
+                    "details": exc.errors(),
+                }
+            },
+        )
+
+    @app.exception_handler(Exception)
+    async def generic_error_handler(_request: Request, exc: Exception):
+        logger.exception("unhandled server exception: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": "internal_error",
+                    "message": "Đã xảy ra lỗi máy chủ nội bộ",
+                    "details": {"error_type": type(exc).__name__},
+                }
+            },
         )
 
     @app.get("/health/live", tags=["system"])

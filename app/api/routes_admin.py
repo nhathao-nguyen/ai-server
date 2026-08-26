@@ -74,11 +74,13 @@ async def list_scopes():
 async def admin_overview(services: AppServices = Depends(get_services)):
     statuses = await services.registry.refresh()
     gpu = services.gpu_probe.read() if services.gpu_probe is not None else None
+    ram = services.memory_probe.read() if services.memory_probe is not None else None
     return {
         "status": "degraded" if any(not item.available for item in statuses) else "ok",
         "service": services.settings.app_name,
         "models": [item.as_dict() for item in statuses],
         "gpu": gpu.as_dict() if gpu is not None else {"available": False, "reason": "not_configured"},
+        "ram": ram.as_dict() if ram is not None else {"total_bytes": None, "used_bytes": None, "utilization_percent": None},
         "scheduler": services.scheduler.get_status(),
     }
 
@@ -141,14 +143,14 @@ async def permanently_delete_api_key(
     key_id: str,
     services: AppServices = Depends(get_services),
 ):
-    services.auth.delete_permanently(key_id)
-    if services.events is not None:
+    result = services.auth.delete_permanently(key_id)
+    if services.events is not None and result.get("status") == "deleted":
         services.events.publish(
             "api_key.deleted",
             message="API key permanently deleted",
             metadata={"key_id": key_id},
         )
-    return {"status": "deleted", "id": key_id}
+    return result
 
 
 @router.get("/usage")
@@ -172,9 +174,27 @@ async def admin_usage(
         if value:
             clauses.append(expression)
             parameters.append(value)
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    where_sql = f"WHERE {' AND '.join(['u.' + c if not c.startswith('u.') else c for c in clauses])}" if clauses else ""
     rows = services.db.fetch_all(
-        f"SELECT api_key_id, COUNT(*) AS events, COALESCE(SUM(credits_charged), 0) AS credits FROM usage_events {where} GROUP BY api_key_id ORDER BY events DESC",
+        f"""
+        SELECT 
+            u.api_key_id,
+            COALESCE(k.key_prefix, u.api_key_id) AS key_prefix,
+            COALESCE(k.label, '') AS label,
+            COALESCE(k.credits, 0) AS credits_remaining,
+            COALESCE(k.daily_quota_credits, 0) AS daily_quota_credits,
+            COUNT(*) AS events,
+            COALESCE(SUM(u.credits_charged), 0) AS credits,
+            COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+            COALESCE(SUM(u.characters), 0) AS characters,
+            COALESCE(SUM(u.audio_duration_ms), 0) AS audio_duration_ms
+        FROM usage_events u
+        LEFT JOIN api_keys k ON u.api_key_id = k.id
+        {where_sql}
+        GROUP BY u.api_key_id
+        ORDER BY events DESC
+        """,
         tuple(parameters),
     )
     return {

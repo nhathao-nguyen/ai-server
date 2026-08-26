@@ -3,10 +3,12 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-tmp-*/
 .coverage
 htmlcov/
 dist/
 build/
+artifacts/
 *.egg-info/
 node_modules/
 frontend/dist/
@@ -18,6 +20,9 @@ data/cache/*
 data/models/*
 data/manifests/*
 data/logs/*
+data/backups/*
+data/locks/*
+data/temp/*
 data/server.db*
 data/*.json
 

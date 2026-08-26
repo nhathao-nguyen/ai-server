@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
@@ -60,6 +61,13 @@ class Settings(BaseSettings):
     def validate_gpu_job_limit(cls, value: int) -> int:
         if not 1 <= value <= 4:
             raise ValueError("MAX_GPU_AI_JOBS must be between 1 and 4")
+        return value
+
+    @field_validator("tls_cert_file", "tls_key_file", "hf_home", "manifest_dir", mode="before")
+    @classmethod
+    def normalize_empty_path(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
         return value
 
     @field_validator("ollama_url")
