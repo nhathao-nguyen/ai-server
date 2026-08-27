@@ -72,7 +72,13 @@ async def list_scopes():
 
 @router.get("/overview")
 async def admin_overview(services: AppServices = Depends(get_services)):
-    statuses = await services.registry.refresh()
+    # The dashboard polls this endpoint. Re-probing Ollama and local model
+    # dependencies on every poll is both expensive and capable of piling up
+    # overlapping UI requests. Model refresh remains available through
+    # /v1/models and /v1/admin/models; overview reports the latest snapshot.
+    statuses = services.registry.current()
+    if not statuses:
+        statuses = await services.registry.refresh()
     gpu = services.gpu_probe.read() if services.gpu_probe is not None else None
     ram = services.memory_probe.read() if services.memory_probe is not None else None
     return {

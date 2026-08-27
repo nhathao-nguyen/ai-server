@@ -1,5 +1,6 @@
 import sqlite3
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,11 +17,17 @@ def backup_database(database_path: Path, backup_dir: Path, *, keep: int = 5) -> 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     destination = backup_dir / f"server-{stamp}.db"
     try:
-        with sqlite3.connect(database_path) as source, sqlite3.connect(destination) as target:
-            source.backup(target)
-            integrity = target.execute("PRAGMA integrity_check").fetchone()
-            if not integrity or integrity[0] != "ok":
-                raise RuntimeError("SQLite backup integrity check failed")
+        # sqlite3.Connection's context manager only commits or rolls back; it
+        # does not close the connection. Explicitly close both handles so the
+        # resulting backup can be copied or restored immediately on Windows.
+        with closing(sqlite3.connect(database_path)) as source, closing(
+            sqlite3.connect(destination)
+        ) as target:
+            with target:
+                source.backup(target)
+                integrity = target.execute("PRAGMA integrity_check").fetchone()
+                if not integrity or integrity[0] != "ok":
+                    raise RuntimeError("SQLite backup integrity check failed")
     except Exception:
         destination.unlink(missing_ok=True)
         raise

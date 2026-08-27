@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -49,6 +50,7 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUN_SERVER = PROJECT_ROOT / "scripts" / "run_server.ps1"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 SCOPE_HINTS = (
     "admin.full",
     "llm.generate",
@@ -57,6 +59,71 @@ SCOPE_HINTS = (
     "tts.clone",
     "usage.read",
 )
+
+
+def _ollama_is_ready() -> bool:
+    """Return whether the local Ollama HTTP API is responding."""
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=1.5) as response:
+            return 200 <= response.status < 300
+    except (OSError, urllib.error.URLError, ValueError):
+        return False
+
+
+def _ollama_executable() -> str | None:
+    """Resolve the Ollama executable on Windows and on PATH."""
+    found = shutil.which("ollama")
+    if found:
+        return found
+    candidates = (
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe",
+        Path(os.environ.get("ProgramFiles", "")) / "Ollama" / "ollama.exe",
+    )
+    return next((str(path) for path in candidates if path.is_file()), None)
+
+
+def ensure_ollama_started() -> str:
+    """Start local Ollama when needed and wait briefly for its API."""
+    if _ollama_is_ready():
+        return "ollama_ready_existing"
+
+    executable = _ollama_executable()
+    if executable is None:
+        return "ollama_not_installed"
+
+    # A desktop Ollama process may still be starting. Avoid launching a second
+    # server when the executable is already present but its API is not ready.
+    try:
+        existing = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq ollama.exe"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        has_process = "ollama.exe" in existing.stdout.lower()
+    except (OSError, subprocess.SubprocessError):
+        has_process = False
+
+    if not has_process:
+        try:
+            subprocess.Popen(
+                [executable, "serve"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                close_fds=(os.name != "nt"),
+            )
+        except OSError as exc:
+            return f"ollama_start_failed:{type(exc).__name__}"
+
+    for _ in range(30):
+        if _ollama_is_ready():
+            return "ollama_ready_started"
+        time.sleep(1)
+    return "ollama_start_timeout"
 
 DARK_THEME_QSS = """
 QMainWindow {
@@ -503,7 +570,11 @@ class AdminWindow(QMainWindow):
         self.scope_checks: dict[str, QCheckBox] = {}
         self._active_tasks: set[ApiTask] = set()
         self.cached_models: list[dict[str, Any]] = []
+        self.studio_models: list[dict[str, Any]] = []
         self.last_audio_bytes: bytes | None = None
+        self._realtime_inflight = False
+        self._error_dialog: QMessageBox | None = None
+        self._startup_probe_attempts = 0
         
         self.auto_refresh_timer = QTimer(self)
         self.auto_refresh_timer.timeout.connect(self.on_auto_refresh)
@@ -626,7 +697,7 @@ class AdminWindow(QMainWindow):
         # Realtime toggle row
         rt_row = QHBoxLayout()
         self.chk_realtime_dashboard = QCheckBox("⚡ Giám sát Realtime (Mỗi 2s)")
-        self.chk_realtime_dashboard.setChecked(True)
+        self.chk_realtime_dashboard.setChecked(False)
         self.chk_realtime_dashboard.stateChanged.connect(self._toggle_realtime_monitor)
         rt_row.addWidget(self.chk_realtime_dashboard)
         rt_row.addStretch()
@@ -689,7 +760,9 @@ class AdminWindow(QMainWindow):
         self.studio_speed = QSlider(Qt.Horizontal)
         self.studio_speed.setRange(5, 20)
         self.studio_speed.setValue(10)
-        self.studio_speed_label = QLabel("1.0x")
+        self.studio_speed.setEnabled(False)
+        self.studio_speed.setToolTip("Runtime hiện chỉ hỗ trợ tốc độ 1.0x")
+        self.studio_speed_label = QLabel("1.0x (cố định)")
         self.studio_speed.valueChanged.connect(lambda v: self.studio_speed_label.setText(f"{v/10:.1f}x"))
 
         cfg_layout.addWidget(QLabel("Mô hình TTS:"), 0, 0)
@@ -709,9 +782,21 @@ class AdminWindow(QMainWindow):
         sample_bar = QHBoxLayout()
         sample_bar.addWidget(QLabel("Mẫu câu nhanh:"))
         btn_sample_vi = QPushButton("🇻🇳 Tiếng Việt mẫu")
-        btn_sample_vi.clicked.connect(lambda: self.studio_text.setPlainText("Sáng nay lúc 7 giờ 45, thời tiết rất đẹp, chúng ta cùng đi uống cà phê nhé!"))
+        btn_sample_vi.clicked.connect(
+            lambda: self._apply_studio_sample(
+                "Sáng nay lúc 7 giờ 45, thời tiết rất đẹp, chúng ta cùng đi uống cà phê nhé!",
+                "vi",
+                "tts-vietnamese",
+            )
+        )
         btn_sample_en = QPushButton("🇺🇸 English sample")
-        btn_sample_en.clicked.connect(lambda: self.studio_text.setPlainText("Hello! Welcome to the high performance AI text to speech gateway."))
+        btn_sample_en.clicked.connect(
+            lambda: self._apply_studio_sample(
+                "Hello! Welcome to the high performance AI text to speech gateway.",
+                "en",
+                "tts-multilingual",
+            )
+        )
         sample_bar.addWidget(btn_sample_vi)
         sample_bar.addWidget(btn_sample_en)
         sample_bar.addStretch()
@@ -759,10 +844,9 @@ class AdminWindow(QMainWindow):
         self.tabs.addTab(page, "🎙 TTS Studio")
 
     def _on_studio_model_changed(self) -> None:
-        idx = self.studio_model.currentIndex()
-        if idx < 0 or idx >= len(self.cached_models):
+        model = self.studio_model.currentData()
+        if not isinstance(model, dict):
             return
-        model = self.cached_models[idx]
         cap = model.get("capabilities") or {}
         
         self.studio_lang.blockSignals(True)
@@ -776,12 +860,33 @@ class AdminWindow(QMainWindow):
         for voice in voices:
             self.studio_voice.addItem(str(voice))
 
+    def _apply_studio_sample(self, text: str, language: str, model_id: str) -> None:
+        self.studio_text.setPlainText(text)
+        for index in range(self.studio_model.count()):
+            model = self.studio_model.itemData(index)
+            if isinstance(model, dict) and model.get("id") == model_id:
+                self.studio_model.setCurrentIndex(index)
+                break
+        language_index = self.studio_lang.findText(language)
+        if language_index >= 0:
+            self.studio_lang.setCurrentIndex(language_index)
+
     def studio_synthesize(self) -> None:
         text = self.studio_text.toPlainText().strip()
         if not text:
             self.show_error("Vui lòng nhập văn bản cần đọc")
             return
-        model_id = self.studio_model.currentText().split(" ")[0] if self.studio_model.count() else "tts-vietnamese"
+        product_key = self.product_key.text().strip()
+        if not product_key:
+            self.studio_status.setText("❌ Cần Product API Key")
+            self.show_error("Vui lòng nhập Product API Key có scope tts.generate")
+            return
+        model = self.studio_model.currentData()
+        model_id = str(model.get("id") or "") if isinstance(model, dict) else ""
+        if not model_id:
+            self.studio_status.setText("❌ Chưa có mô hình TTS")
+            self.show_error("Không có mô hình TTS nào trong model catalog hiện tại")
+            return
         lang = self.studio_lang.currentText() or "vi"
         voice = self.studio_voice.currentText() or "default"
         speed = 1.0  # Currently server engines require speed=1.0
@@ -806,9 +911,12 @@ class AdminWindow(QMainWindow):
                 return
             self.last_audio_bytes = wav_data
             self.audio_player.play_bytes(wav_data)
-            headers = res.get("headers", {})
-            dur_ms = headers.get("X-TTS-Duration-Ms", "—")
-            gen_ms = headers.get("X-TTS-Generation-Ms", "—")
+            headers = {
+                str(name).lower(): value
+                for name, value in (res.get("headers") or {}).items()
+            }
+            dur_ms = headers.get("x-tts-duration-ms", "—")
+            gen_ms = headers.get("x-tts-generation-ms", "—")
             self.studio_status.setText(f"✅ Đã phát audio ({len(wav_data):,} bytes | Độ dài: {dur_ms}ms | Xử lý: {gen_ms}ms)")
 
         def on_error(err: str) -> None:
@@ -816,12 +924,11 @@ class AdminWindow(QMainWindow):
             self.studio_status.setText("❌ Lỗi sinh giọng")
             self.show_error(err)
 
-        key = self.product_key.text().strip() or self.admin_key.text().strip()
         task = ApiTask(
             self.target.text(),
             "/v1/audio/speech",
             "POST",
-            key,
+            product_key,
             body,
             on_done,
             on_error,
@@ -836,6 +943,10 @@ class AdminWindow(QMainWindow):
         text = self.studio_text.toPlainText().strip()
         if not text:
             self.show_error("Vui lòng nhập văn bản cần dịch")
+            return
+        if not self.product_key.text().strip():
+            self.studio_status.setText("❌ Cần Product API Key")
+            self.show_error("Vui lòng nhập Product API Key có scope llm.translate và tts.generate")
             return
         
         # Determine target language: if currently Vietnamese, translate to English, else to Vietnamese
@@ -880,7 +991,18 @@ class AdminWindow(QMainWindow):
             # Trigger synthesis
             self.studio_synthesize()
 
-        self.call("/v1/translations", "POST", "product", on_translated, body)
+        def on_translation_error(err: str) -> None:
+            self.studio_status.setText("❌ Lỗi dịch LLM")
+            self.show_error(err)
+
+        self.call(
+            "/v1/translations",
+            "POST",
+            "product",
+            on_translated,
+            body,
+            error_callback=on_translation_error,
+        )
 
     def studio_save_wav(self) -> None:
         if not self.last_audio_bytes:
@@ -1150,6 +1272,11 @@ class AdminWindow(QMainWindow):
     def render_models(self, data: dict[str, Any]) -> None:
         models = data.get("models") or data.get("data") or []
         self.cached_models = models
+        self.studio_models = [
+            model
+            for model in models
+            if str(model.get("id") or "").startswith("tts-")
+        ]
         self.model_table.setRowCount(0)
         
         self.studio_model.clear()
@@ -1179,8 +1306,17 @@ class AdminWindow(QMainWindow):
                     item.setForeground(QColor("#10b981") if is_avail else QColor("#ef4444"))
                 self.model_table.setItem(row, col, item)
 
-            # Populate studio dropdown
-            self.studio_model.addItem(f"{model.get('id')} ({model.get('provider')})")
+        for model in self.studio_models:
+            self.studio_model.addItem(
+                f"{model.get('id')} ({model.get('provider')})",
+                model,
+            )
+
+        for index in range(self.studio_model.count()):
+            model = self.studio_model.itemData(index)
+            if isinstance(model, dict) and model.get("id") == "tts-vietnamese":
+                self.studio_model.setCurrentIndex(index)
+                break
 
         self.card_models.set_value(f"{available_count} / {len(models)}", "#10b981" if available_count else "#ef4444")
         self._on_studio_model_changed()
@@ -1476,9 +1612,23 @@ class AdminWindow(QMainWindow):
         key_kind: str,
         callback: Callable[[dict[str, Any]], None],
         body: Any = None,
+        error_callback: Callable[[str], None] | None = None,
     ) -> None:
-        key = self.admin_key.text().strip() if key_kind == "admin" else (self.product_key.text().strip() or self.admin_key.text().strip())
-        task = ApiTask(self.target.text(), path, method, key, body, callback, lambda error: self.show_error(error))
+        if key_kind == "admin":
+            key = self.admin_key.text().strip()
+        elif key_kind == "product":
+            key = self.product_key.text().strip()
+        else:
+            key = ""
+        task = ApiTask(
+            self.target.text(),
+            path,
+            method,
+            key,
+            body,
+            callback,
+            error_callback or self.show_error,
+        )
         task.signals.done.connect(self._dispatch_api_result, Qt.QueuedConnection)
         self._active_tasks.add(task)
         self.pool.start(task)
@@ -1499,15 +1649,31 @@ class AdminWindow(QMainWindow):
 
     def show_error(self, error: str) -> None:
         self.statusBar().showMessage(f"Lỗi: {error}", 10000)
-        QMessageBox.critical(self, "TTS Server Admin", error)
+        if self._error_dialog is not None:
+            self._error_dialog.setText(error)
+            return
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("TTS Server Admin")
+        dialog.setIcon(QMessageBox.Critical)
+        dialog.setText(error)
+        dialog.setStandardButtons(QMessageBox.Ok)
+        dialog.finished.connect(self._clear_error_dialog)
+        self._error_dialog = dialog
+        dialog.open()
+
+    def _clear_error_dialog(self, _result: int) -> None:
+        self._error_dialog = None
 
     def show_ops(self, data: dict[str, Any]) -> None:
         QMessageBox.information(self, "Kết quả vận hành", json.dumps(data, ensure_ascii=False, indent=2))
 
     def connect(self) -> None:
+        if not self.admin_key.text().strip():
+            self.show_error("Vui lòng nhập Admin API Key có scope admin.full")
+            return
         self.statusBar().showMessage("Đang kết nối tới server...", 3000)
-        
-        def done(data: dict[str, Any]) -> None:
+
+        def authorized(data: dict[str, Any], scopes_data: dict[str, Any]) -> None:
             self.status_dot.setText("● Đã kết nối")
             self.status_dot.setStyleSheet("color: #10b981; font-weight: bold; font-size: 12px;")
             
@@ -1515,18 +1681,26 @@ class AdminWindow(QMainWindow):
             self.card_status.set_subtitle(f"{data.get('service', 'tts-server')} v{data.get('version', '0.1.0')}")
             
             self.dashboard_text.setPlainText(json.dumps(data, ensure_ascii=False, indent=2))
-            
+
             # Chain refresh sub-components
-            self.call("/v1/models", "GET", "product", self.render_models)
+            self.call("/v1/admin/models", "GET", "admin", self.render_models)
             self.call("/v1/admin/overview", "GET", "admin", self._update_overview)
-            self.call("/v1/admin/scopes", "GET", "admin", lambda d: self._render_scopes(d.get("scopes", [])))
+            self._render_scopes(scopes_data.get("scopes", []))
             self.load_keys()
             self.load_metrics()
 
             if self.chk_realtime_dashboard.isChecked():
                 self.realtime_timer.start(2000)
 
-        self.call("/health/live", "GET", "product", done)
+        def server_live(data: dict[str, Any]) -> None:
+            self.call(
+                "/v1/admin/scopes",
+                "GET",
+                "admin",
+                lambda scopes_data: authorized(data, scopes_data),
+            )
+
+        self.call("/health/live", "GET", "public", server_live)
 
     def _toggle_realtime_monitor(self, state: int) -> None:
         if state == Qt.Checked and self.card_status.val_label.text() == "ONLINE":
@@ -1535,8 +1709,25 @@ class AdminWindow(QMainWindow):
             self.realtime_timer.stop()
 
     def _poll_realtime(self) -> None:
-        if self.card_status.val_label.text() == "ONLINE":
-            self.call("/v1/admin/overview", "GET", "admin", self._update_overview)
+        if self.card_status.val_label.text() != "ONLINE" or self._realtime_inflight:
+            return
+        self._realtime_inflight = True
+
+        def done(data: dict[str, Any]) -> None:
+            self._realtime_inflight = False
+            self._update_overview(data)
+
+        def failed(error: str) -> None:
+            self._realtime_inflight = False
+            self.statusBar().showMessage(f"Realtime tạm dừng: {error}", 10000)
+
+        self.call(
+            "/v1/admin/overview",
+            "GET",
+            "admin",
+            done,
+            error_callback=failed,
+        )
 
     def _update_overview(self, data: dict[str, Any]) -> None:
         # Update RAM info
@@ -1557,8 +1748,8 @@ class AdminWindow(QMainWindow):
         gpu = data.get("gpu") or {}
         if gpu.get("available"):
             gpu_name = gpu.get("name") or "CUDA GPU"
-            vram_total = gpu.get("vram_total_bytes", 0)
-            vram_used = gpu.get("vram_allocated_bytes", 0)
+            vram_total = int(gpu.get("total_memory_mb") or 0) * 1024 * 1024
+            vram_used = int(gpu.get("used_memory_mb") or 0) * 1024 * 1024
             vram_pct = int((vram_used / vram_total * 100)) if vram_total else 0
             self.card_gpu.set_value(f"{gpu_name}", "#818cf8")
             self.card_gpu.set_subtitle(f"VRAM: {vram_used // (1024*1024):,} / {vram_total // (1024*1024):,} MB ({vram_pct}%)")
@@ -1572,7 +1763,7 @@ class AdminWindow(QMainWindow):
 
         # Scheduler
         sched = data.get("scheduler") or {}
-        active_jobs = sched.get("active_jobs", 0)
+        active_jobs = sched.get("running", 0)
         gpu_q = sched.get("gpu_queue_depth", 0)
         cpu_q = sched.get("cpu_queue_depth", 0)
         self.card_scheduler.set_value(f"Active: {active_jobs}", "#10b981" if active_jobs else "#ffffff")
@@ -1588,15 +1779,49 @@ class AdminWindow(QMainWindow):
         try:
             self.server.start(self.bind_host.text().strip(), self.bind_port.value(), self.insecure.isChecked())
             self.append_log(f"[UI] Đang khởi động server trên {self.bind_host.text().strip()}:{self.bind_port.value()}...")
+            self.statusBar().showMessage("Đang chờ server khởi động hoàn tất...", 0)
+            self.btn_connect.setEnabled(False)
             self.btn_toggle_server.setText("⏹ Dừng Server")
             self.btn_toggle_server.setObjectName("dangerButton")
             self.btn_toggle_server.setStyle(self.btn_toggle_server.style())
+            self._startup_probe_attempts = 0
+            QTimer.singleShot(500, self._probe_server_startup)
         except Exception as exc:
             self.show_error(str(exc))
+
+    def _probe_server_startup(self) -> None:
+        if not self.server.running():
+            self.btn_connect.setEnabled(True)
+            self.statusBar().showMessage("Tiến trình server đã dừng; xem tab Vận hành & Logs.", 10000)
+            self.btn_toggle_server.setText("▶ Bật Server")
+            self.btn_toggle_server.setObjectName("successButton")
+            self.btn_toggle_server.setStyle(self.btn_toggle_server.style())
+            return
+
+        self._startup_probe_attempts += 1
+
+        def ready(_data: dict[str, Any]) -> None:
+            self.btn_connect.setEnabled(True)
+            self.statusBar().showMessage("Server đã sẵn sàng.", 5000)
+            if self.admin_key.text().strip():
+                self.connect()
+            else:
+                self.status_dot.setText("● Server sẵn sàng — cần Admin Key")
+                self.status_dot.setStyleSheet("color: #f59e0b; font-weight: bold; font-size: 12px;")
+
+        def retry(_error: str) -> None:
+            if self._startup_probe_attempts >= 60:
+                self.btn_connect.setEnabled(True)
+                self.statusBar().showMessage("Server chưa sẵn sàng sau 60 giây; xem tab Vận hành & Logs.", 10000)
+                return
+            QTimer.singleShot(1000, self._probe_server_startup)
+
+        self.call("/health/live", "GET", "public", ready, error_callback=retry)
 
     def stop_server(self) -> None:
         self.server.stop()
         self.append_log("[UI] Server đã dừng.")
+        self.btn_connect.setEnabled(True)
         self.btn_toggle_server.setText("▶ Bật Server")
         self.btn_toggle_server.setObjectName("successButton")
         self.btn_toggle_server.setStyle(self.btn_toggle_server.style())
@@ -1629,6 +1854,7 @@ def main() -> None:
             "project_root": str(PROJECT_ROOT),
         }))
         return
+    print(f"[UI] {ensure_ollama_started()}", flush=True)
     app = QApplication([])
     app.setStyle("Fusion")
     window = AdminWindow()

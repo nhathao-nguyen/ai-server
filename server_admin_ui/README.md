@@ -10,11 +10,19 @@ Từ thư mục dự án:
 .\server_admin_ui\run_desktop.ps1
 ```
 
-Launcher dùng `.venv` của dự án và kiểm tra PySide6 trước khi mở cửa sổ. Có thể kiểm tra runtime trước:
+Hoặc chạy trực tiếp bằng Python (cũng tự khởi động Ollama):
+
+```powershell
+.\.venv\Scripts\python.exe server_admin_ui\server.py
+```
+
+Launcher dùng `.venv` của dự án và kiểm tra PySide6 trước khi mở cửa sổ. Khi khởi chạy, UI tự kiểm tra Ollama tại `127.0.0.1:11434`; nếu chưa chạy, UI sẽ mở `ollama serve` ở chế độ nền rồi chờ API sẵn sàng. Có thể kiểm tra runtime trước:
 
 ```powershell
 .venv\Scripts\python.exe server_admin_ui\server.py --self-test
 ```
+
+Nếu không cài Ollama, UI vẫn mở nhưng các chức năng LLM/dịch sẽ báo Ollama chưa khả dụng.
 
 Nhập URL server, admin API key và product API key trong cửa sổ desktop. Key chỉ nằm trong bộ nhớ process, không được lưu vào file.
 
