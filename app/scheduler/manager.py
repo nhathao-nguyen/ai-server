@@ -328,7 +328,7 @@ class JobManager:
         while True:
             async with self._gpu_selection_lock:
                 item = await self._gpu_queue.get_next(
-                    self.gpu_lock.owner,
+                    self._gpu_last_provider,
                     self._gpu_consecutive,
                     self.gpu_affinity_batch_size,
                 )
